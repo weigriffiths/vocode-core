@@ -1,0 +1,37 @@
+name: Sync Fork
+
+# Schedule the action to run at a specific time using cron syntax
+on:
+  schedule:
+    - cron: '0 0 * * 1' # This runs the action every Monday at midnight UTC
+  workflow_dispatch: # Allows you to manually trigger the workflow
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+        with:
+          # Repository to checkout (uses the GITHUB_TOKEN)
+          repository: ${{ github.repository }}
+
+      - name: Set up Git
+        run: |
+          git config --global user.name "${{ github.actor }}"
+          git config --global user.email "${{ github.actor }}@users.noreply.github.com"
+
+      - name: Add upstream
+        run: git remote add upstream https://github.com/vocodedev/vocode-core.git
+
+      - name: Fetch upstream
+        run: git fetch upstream
+
+      - name: Merge upstream changes
+        run: |
+          git checkout main
+          git merge upstream/main
+
+      - name: Push changes
+        run: git push origin main
