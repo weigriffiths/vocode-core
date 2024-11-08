@@ -1,4 +1,6 @@
+import asyncio
 import hashlib
+from typing import List, Tuple
 
 from loguru import logger
 
@@ -28,7 +30,11 @@ class CartesiaSynthesizer(BaseSynthesizer[CartesiaSynthesizerConfig]):
 
         self.cartesia_tts = AsyncCartesia
 
-        self._experimental_voice_controls = synthesizer_config._experimental_voice_controls
+        self._experimental_voice_controls = None
+        if synthesizer_config.experimental_voice_controls:
+            self._experimental_voice_controls = (
+                synthesizer_config.experimental_voice_controls.dict()
+            )
 
         if synthesizer_config.audio_encoding == AudioEncoding.LINEAR16:
             match synthesizer_config.sampling_rate:
@@ -85,6 +91,10 @@ class CartesiaSynthesizer(BaseSynthesizer[CartesiaSynthesizerConfig]):
         self.client = self.cartesia_tts(api_key=self.api_key)
         self.ws = None
         self.ctx = None
+        self.ctx_message = BaseMessage(text="")
+        self.ctx_timestamps: List[Tuple[str, float, float]] = []
+        self.no_more_inputs_task = None
+        self.no_more_inputs_lock = asyncio.Lock()
 
     async def initialize_ws(self):
         if self.ws is None:
@@ -92,12 +102,32 @@ class CartesiaSynthesizer(BaseSynthesizer[CartesiaSynthesizerConfig]):
 
     async def initialize_ctx(self, is_first_text_chunk: bool):
         if self.ctx is None or self.ctx.is_closed():
+            self.ctx_message = BaseMessage(text="")
+            self.ctx_timestamps = []
             if self.ws:
                 self.ctx = self.ws.context()
         else:
             if is_first_text_chunk:
+                self.ctx_message = BaseMessage(text="")
+                self.ctx_timestamps = []
+                if self.no_more_inputs_task:
+                    self.no_more_inputs_task.cancel()
                 await self.ctx.no_more_inputs()
                 self.ctx = self.ws.context()
+
+    # This workaround is necessary to prevent the last chunk getting delayed.
+    # In the future, `create_speech_uncached` should be modified to handle this properly by adding a flag to the last chunk.
+    def refresh_no_more_inputs_task(self):
+        if self.no_more_inputs_task:
+            self.no_more_inputs_task.cancel()
+
+        async def delayed_no_more_inputs():
+            await asyncio.sleep(1)
+            async with self.no_more_inputs_lock:
+                if self.ctx:
+                    await self.ctx.no_more_inputs()
+
+        self.no_more_inputs_task = asyncio.create_task(delayed_no_more_inputs())
 
     async def create_speech_uncached(
         self,
@@ -121,8 +151,14 @@ class CartesiaSynthesizer(BaseSynthesizer[CartesiaSynthesizerConfig]):
                 voice_id=self.voice_id,
                 continue_=not is_sole_text_chunk,
                 output_format=self.output_format,
+                add_timestamps=True,
                 _experimental_voice_controls=self._experimental_voice_controls,
             )
+            if not is_sole_text_chunk:
+                try:
+                    self.refresh_no_more_inputs_task()
+                except Exception as e:
+                    logger.info(f"Caught error while sending no more inputs: {e}")
 
         async def chunk_generator(context):
             buffer = bytearray()
@@ -131,25 +167,57 @@ class CartesiaSynthesizer(BaseSynthesizer[CartesiaSynthesizerConfig]):
             try:
                 async for event in context.receive():
                     audio = event.get("audio")
-                    buffer.extend(audio)
-                    while len(buffer) >= chunk_size:
-                        yield SynthesisResult.ChunkResult(
-                            chunk=buffer[:chunk_size], is_last_chunk=False
-                        )
-                        buffer = buffer[chunk_size:]
+                    word_timestamps = event.get("word_timestamps")
+                    if word_timestamps:
+                        words = word_timestamps["words"]
+                        start_times = word_timestamps["start"]
+                        end_times = word_timestamps["end"]
+                        for word, start, end in zip(words, start_times, end_times):
+                            self.ctx_timestamps.append((word, start, end))
+                    if audio:
+                        buffer.extend(audio)
+                        while len(buffer) >= chunk_size:
+                            yield SynthesisResult.ChunkResult(
+                                chunk=buffer[:chunk_size], is_last_chunk=False
+                            )
+                            buffer = buffer[chunk_size:]
             except Exception as e:
                 logger.info(
                     f"Caught error while receiving audio chunks from CartesiaSynthesizer: {e}"
                 )
                 self.ctx._close()
             if buffer:
+                # pad the leftover buffer with silence
+                if len(buffer) < chunk_size:
+                    padding_size = chunk_size - len(buffer)
+                    if self.output_format["encoding"] == "pcm_mulaw":
+                        buffer.extend(b"\x7f" * padding_size)  # 127 is silence in mu-law
+                    elif self.output_format["encoding"] == "pcm_s16le":
+                        buffer.extend(b"\x00\x00" * padding_size)  # 0 is silence in s16le
                 yield SynthesisResult.ChunkResult(chunk=buffer, is_last_chunk=True)
+
+        self.ctx_message.text += transcript
+
+        def get_message_cutoff_ctx(message, seconds, words_per_minute=150):
+            if seconds:
+                closest_index = 0
+                if len(self.ctx_timestamps) > 0:
+                    for index, word_timestamp in enumerate(self.ctx_timestamps):
+                        _word, start, end = word_timestamp
+                        closest_index = index
+                        if end >= seconds:
+                            break
+                if closest_index:
+                    # Check if they're less than 2 seconds apart, fall back to words per minute otherwise
+                    if self.ctx_timestamps[closest_index][2] - seconds < 2:
+                        return " ".join(
+                            [word for word, *_ in self.ctx_timestamps[: closest_index + 1]]
+                        )
+            return self.get_message_cutoff_from_voice_speed(message, seconds, words_per_minute)
 
         return SynthesisResult(
             chunk_generator=chunk_generator(self.ctx),
-            get_message_up_to=lambda seconds: self.get_message_cutoff_from_voice_speed(
-                message, seconds
-            ),
+            get_message_up_to=lambda seconds: get_message_cutoff_ctx(self.ctx_message, seconds),
         )
 
     @classmethod
@@ -167,6 +235,8 @@ class CartesiaSynthesizer(BaseSynthesizer[CartesiaSynthesizerConfig]):
 
     async def tear_down(self):
         await super().tear_down()
+        if self.no_more_inputs_task:
+            self.no_more_inputs_task.cancel()
         if self.ctx:
             self.ctx._close()
         await self.ws.close()
